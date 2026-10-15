@@ -169,7 +169,9 @@ class Planner:
             return loc.list_files(parent, recursive=True)
         # Episoden, Filme in flacher Ablage, movie_mode=file: nur Dateien mit gleichem Basisnamen (mkv, srt, nfo …)
         stem = rel.stem
-        return [f for f in loc.list_files(parent, recursive=False) if f.name.startswith(stem)]
+        files = [f for f in loc.list_files(parent, recursive=False) if f.name.startswith(stem)]
+        # Jellyfin legt Trickplay-Vorschaubilder (bei «neben den Medien speichern») in <Basisname>.trickplay/ ab
+        return files + loc.list_files(parent / f"{stem}.trickplay", recursive=True)
 
     def make_group(self, loc, item, category, chain, source, title, uname, series=None):
         reason = f"{uname}: {source} «{series + ' – ' if series else ''}{title}»"

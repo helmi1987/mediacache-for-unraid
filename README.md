@@ -147,6 +147,8 @@ Das Budget bezieht sich auf den Inhalt der Exclude-Liste, also auf das, was das 
 
 Filme: Liegt der Film in einem eigenen Ordner, wird der ganze Ordner mitgenommen (Untertitel, nfo, Extras). Liegt er direkt im Bibliotheksordner (flache Ablage), werden nur die Dateien mit gleichem Basisnamen genommen – die Bibliothek wird nie als Ganzes verschoben. Ordner-Items (DVD/BluRay-Struktur) werden als Ordner behandelt.
 
+Sidecars bei Episoden und gleichnamigen Dateien: alle Dateien mit gleichem Basisnamen (mkv, srt, nfo, Emby-`.bif` …) plus der Jellyfin-Trickplay-Ordner `<Basisname>.trickplay/` (Vorschaubilder, wenn «Trickplay neben den Medien speichern» aktiv ist).
+
 ## Befehle
 
 | Befehl | Wirkung |
