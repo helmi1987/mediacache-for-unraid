@@ -1,22 +1,24 @@
 # 🎬 MediaCache für Unraid
 
-Verschiebt die Medien, die Emby-Benutzer als Nächstes sehen werden («Weiterschauen», die nächsten Folgen, Favoriten-Serien), vom Array auf den Cache-Pool und räumt sie wieder aufs Array, sobald sie nicht mehr gebraucht werden. Die Array-Platten können dadurch schlafen, und die Wiedergabe startet ohne Spin-up.
+Für **Emby** und **Jellyfin** (pro Instanz `type`), auch gemischt. Jellyfin ab 10.9 (neue Endpunkte `/Items?userId=`, `/UserItems/Resume`, Auth-Header `Authorization: MediaBrowser Token="…"`).
 
-Emby merkt davon nichts, weil es die Medien über `/mnt/user/...` sieht – egal ob eine Datei gerade auf dem Pool oder auf einer Array-Disk liegt.
+Verschiebt die Medien, die Emby- und Jellyfin-Benutzer als Nächstes sehen werden («Weiterschauen», die nächsten Folgen, Favoriten-Serien), vom Array auf den Cache-Pool und räumt sie wieder aufs Array, sobald sie nicht mehr gebraucht werden. Die Array-Platten können dadurch schlafen, und die Wiedergabe startet ohne Spin-up.
+
+Der Medienserver merkt davon nichts, weil er die Medien über `/mnt/user/...` sieht – egal ob eine Datei gerade auf dem Pool oder auf einer Array-Disk liegt.
 
 ## Was das Script macht
 
 | Phase | Aktion | Beschreibung |
 | --- | --- | --- |
 | 1. Schutz | Sessions | Fragt alle Instanzen, was **gerade läuft**. Diese Dateien werden nie verschoben. |
-| 2. Analyse | On-Deck | Pro Benutzer: «Weiterschauen»-Einträge und Embys «Als Nächstes» (NextUp – damit eine Serie zwischen zwei Folgen nicht aus dem Cache fällt), bei Serien die nächsten Folgen **in Serienreihenfolge** (nach der aktuellen Folge), plus die nächsten ungesehenen Folgen von Favoriten-Serien. Umfang nach Zähler (`number_episodes`) oder nach **Budget** (`cache_budget`, siehe unten). |
+| 2. Analyse | On-Deck | Pro Benutzer: «Weiterschauen»-Einträge und «Als Nächstes» des Servers (NextUp – damit eine Serie zwischen zwei Folgen nicht aus dem Cache fällt), bei Serien die nächsten Folgen **in Serienreihenfolge** (nach der aktuellen Folge), plus die nächsten ungesehenen Folgen von Favoriten-Serien. Umfang nach Zähler (`number_episodes`) oder nach **Budget** (`cache_budget`, siehe unten). |
 | 3. Cleanup | Cache → Array | Dateien aus der letzten Exclude-Liste, die nicht mehr on deck sind, gehen zurück aufs Array – über das Unraid-`move`-Binary (`cleanup_tool: mover`, Default wie im Original; setzt Mover-Richtung Cache → Array voraus, das Script prüft und meldet sie) oder per `rsync` nach `/mnt/user0` (`cleanup_tool: rsync`, unabhängig von der Share-Einstellung). **Zuerst**, damit Platz frei wird. |
 | 4. Befüllen | Array → Cache | On-Deck-Dateien kommen auf den Pool – per `rsync -aAX --numeric-ids /mnt/user0/… /mnt/<pool>/…` **exakt wie im Original**, Quelle erst gelöscht, wenn rsync mit 0 endet und die Grösse stimmt (`fill_tool: rsync`, Default). Optional liest rsync vom echten `/mnt/diskN`-Pfad (`array_source: disk`) oder die Array-Pfade gehen ans Unraid-`move`-Binary wie beim Stock-Mover für «prefer»-Shares (`fill_tool: mover`). Der Freiplatz wird vorher für alle geplanten Kopien zusammen geprüft. rsync-Kopien laufen auf Wunsch parallel pro Quell-Disk (`parallel_per_disk`, `parallel_total`, Default: eine nach der anderen). |
 | 5. Exclude-Liste | `mediacache_exclude.txt` | Alle On-Deck-Dateien, die jetzt auf dem Cache liegen – für Mover Tuning («File list path»), damit der reguläre Mover sie in Ruhe lässt. |
 
 Der Dry-Run trifft dieselben Entscheidungen wie der scharfe Lauf: Er schreibt nichts (auch nicht die Exclude-Liste), rechnet aber beim Freiplatz-Check den Platz ein, den der Cleanup freigäbe, und zieht jede geplante Kopie ab – so sieht er den Pool an jeder Stelle so, wie ihn der scharfe Lauf dort sähe.
 
-Ist Emby nicht (vollständig) erreichbar, wird der Cleanup übersprungen und die alte Exclude-Liste bleibt geschützt – sonst würde ein kurzer Emby-Neustart den ganzen Cache leeren.
+Ist ein Medienserver nicht (vollständig) erreichbar, wird der Cleanup übersprungen und die alte Exclude-Liste bleibt geschützt – sonst würde ein kurzer Server-Neustart den ganzen Cache leeren.
 
 ## Installation
 
@@ -37,7 +39,7 @@ Ist Emby nicht (vollständig) erreichbar, wird der Cleanup übersprungen und die
 | `mediacache_setup.py` | Interaktiver Konfigurator: Instanzen, Bibliotheken, Pfad-Mapping, Benutzer, Systemwerte |
 | `mediacache_run.py` | Hauptscript (Report / Dry-Run / Run) |
 | `mediacache_cleaner.py` | Findet Dateien auf dem Cache, die nicht in der Exclude-Liste stehen (Waisen), und räumt sie auf Wunsch weg |
-| `mediacache_lib.py` | Gemeinsamer Code (Config, Pfade, Emby-API, Mover, Lock, Logging) |
+| `mediacache_lib.py` | Gemeinsamer Code (Config, Pfade, Emby-/Jellyfin-API, Mover, Lock, Logging) |
 | `mediacache_settings.json` | Konfiguration (siehe unten) |
 | `mediacache_exclude.txt` | Aktuell gecachte Dateien; wird atomar geschrieben (über `mediacache_exclude.tmp`) |
 | `mediacache.lock` | Verhindert parallele Läufe |
@@ -52,13 +54,14 @@ Alle Pfade sind relativ zum **Script-Verzeichnis**, nicht zum Arbeitsverzeichnis
 {
     "cache_path": "/mnt/cache",            // Pool, auf den gecacht wird (z.B. /mnt/master)
     "array_path": "/mnt/user0",            // Array-Sicht ohne Pools
-    "user_path": "/mnt/user",              // Sicht, die Emby gemountet hat
+    "user_path": "/mnt/user",              // Sicht, die der Medienserver gemountet hat
     "array_disks_glob": "/mnt/disk[0-9]*", // echte Array-Disks: Quelle bei array_source: disk, Disk-Zuordnung für Parallelität/Status
     "array_source": "user0",               // rsync-Quelle: user0 = wie das Original, disk = /mnt/diskN (am FUSE vorbei)
 
     "instances": [
         {
             "servername": "Nostromo",
+            "type": "emby",                    // emby | jellyfin (Default: emby)
             "url": "http://192.168.7.10:8096",
             "api_key": "…",
             "path_mappings": {                 // Docker-Pfad -> Host-Pfad, nur gecachte Bibliotheken
@@ -77,7 +80,7 @@ Alle Pfade sind relativ zum **Script-Verzeichnis**, nicht zum Arbeitsverzeichnis
     "max_episodes_per_series": 0,          // Budget-Modus: Folgen pro Serie höchstens (0 = das Budget entscheidet)
     "max_resume_items": 10,                // Weiterschauen-Einträge pro Benutzer (gilt auch als Limit für «Als Nächstes»)
     "max_favorite_series": 10,             // Favoriten-Serien pro Benutzer (0 = aus)
-    "use_next_up": true,                   // Embys «Als Nächstes» als Quelle (fertige Folge, nächste noch nicht gestartet)
+    "use_next_up": true,                   // «Als Nächstes» des Servers als Quelle (fertige Folge, nächste noch nicht gestartet)
     "min_free_percent": 20,                // darunter wird nichts mehr kopiert (ZFS: nicht unter 15–20 gehen)
     "movie_mode": "folder",                // folder = ganzer Filmordner, file = nur gleichnamige Dateien
     "create_share_root": false,            // Share-Wurzel auf dem Pool automatisch anlegen (siehe ZFS-Hinweis)
@@ -193,7 +196,7 @@ Pro Benutzer zuerst die Filme, dann jede Serie als Block mit ihren Folgen in Rei
 
 **Array → Cache über den Unraid-Mover (`fill_tool: mover`).** Der Stock-Mover bringt Dateien von «prefer»-Shares mit `find /mnt/user0/<share> | move` auf den Pool; das Script übergibt dem Binary dieselben Pfade (bevorzugt den echten `/mnt/diskN`-Pfad). Welchen Pool das Binary nimmt, steht in der Share-Konfiguration – für einen Share auf *Array only* gibt es keinen, dann bleibt die Datei liegen und das Script meldet es. Deshalb: mit `mover_debug_level: 1` und einer einzelnen Datei testen, bevor du umstellst. Vorteil gegenüber rsync: fuser-Check und keine doppelte Datei bei Abbruch. Nachteil: kein paralleles Kopieren. Das Werkzeug für den Cleanup (Cache → Array) wählt unabhängig davon `cleanup_tool`.
 
-**Emby-Mounts.** Emby muss die Medien über `/mnt/user/...` sehen (nicht `/mnt/user0` oder `/mnt/diskN`), sonst bricht der transparente Wechsel zwischen Pool und Array.
+**Server-Mounts.** Emby bzw. Jellyfin muss die Medien über `/mnt/user/...` sehen (nicht `/mnt/user0` oder `/mnt/diskN`), sonst bricht der transparente Wechsel zwischen Pool und Array.
 
 **Hardlinks.** Sind Medien per Hardlink mit einem Download-Ordner verbunden (*arr-Setups), trennt rsync + löschen den Hardlink; nach dem Zurückschieben liegt die Datei doppelt.
 

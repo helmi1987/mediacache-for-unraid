@@ -3,7 +3,7 @@
 MediaCache – gemeinsame Funktionen für mediacache_run.py, mediacache_cleaner.py und mediacache_setup.py.
 
 Enthält: Config mit Defaults und Validierung, Pfad-Übersetzung (Docker → Host → relativ zum Share),
-Emby-API-Client (nur Standardbibliothek, kein `requests`), Aufruf des Unraid move-Binaries,
+Emby-/Jellyfin-API-Client (nur Standardbibliothek, kein `requests`), Aufruf des Unraid move-Binaries,
 Lockfile, Exclude-Liste und Logging.
 
 Umgebungsvariablen (gelten für alle Scripte):
@@ -47,10 +47,10 @@ MOVER_PIDFILE = "/var/run/mover.pid"
 DEFAULTS = {
     "cache_path": "/mnt/cache",          # Pool, auf den gecacht wird (z.B. /mnt/cache oder /mnt/master)
     "array_path": "/mnt/user0",          # Array-Sicht ohne Pools (FUSE)
-    "user_path": "/mnt/user",            # Zusammengeführte Sicht (Emby sieht diese Pfade)
+    "user_path": "/mnt/user",            # Zusammengeführte Sicht (der Medienserver sieht diese Pfade)
     "array_disks_glob": "/mnt/disk[0-9]*",  # Echte Array-Disks (Quelle bei array_source = disk, Disk-Zuordnung für Parallelität/Status)
     "array_source": "user0",             # rsync-Quelle: user0 = /mnt/user0/... wie das Original, disk = echte /mnt/diskN-Pfade
-    "instances": [],                     # [{"servername": "...", "url": "...", "api_key": "...", "path_mappings": {...}}]
+    "instances": [],                     # [{"servername": "...", "type": "emby|jellyfin", "url": "...", "api_key": "...", "path_mappings": {...}}]
     "path_mappings": {},                 # Globales Mapping Docker-Pfad -> Host-Pfad (/mnt/user/...)
     "libraries": [],                     # Nur informativ (Wizard); Filter passiert über path_mappings
     "valid_users": [],                   # Liste von User-IDs oder Dict {id: {"budget": "300G"}}; leer = alle Benutzer
@@ -60,7 +60,7 @@ DEFAULTS = {
     "max_episodes_per_series": 0,        # Budget-Modus: Folgen pro Serie höchstens (0 = das Budget entscheidet)
     "max_resume_items": 10,              # Wie viele "Weiterschauen"-Einträge pro Benutzer berücksichtigt werden
     "max_favorite_series": 10,           # Wie viele Favoriten-Serien pro Benutzer (0 = keine Favoriten)
-    "use_next_up": True,                 # Auch Embys «Als Nächstes» (/Shows/NextUp) als Quelle – hält Serien zwischen zwei Folgen im Cache
+    "use_next_up": True,                 # Auch «Als Nächstes» des Servers (/Shows/NextUp) als Quelle – hält Serien zwischen zwei Folgen im Cache
     "min_free_percent": 20,              # Unter diesem Freiplatz (Prozent) wird nichts mehr auf den Cache kopiert
     "movie_mode": "folder",              # folder = ganzer Filmordner mitnehmen, file = nur Dateien mit gleichem Namen
     "create_share_root": False,          # Share-Wurzel auf dem Pool automatisch anlegen (ZFS: besser vorher als Dataset!)
@@ -189,10 +189,13 @@ def load_config(require_paths=True):
         raise ConfigError("movie_share_percent muss zwischen 0 und 100 liegen")
 
     if not cfg["instances"]:
-        raise ConfigError("Keine Emby-Instanz konfiguriert (instances)")
+        raise ConfigError("Keine Medienserver-Instanz konfiguriert (instances)")
     for i, inst in enumerate(cfg["instances"], 1):
         inst["url"] = str(inst.get("url", "")).rstrip("/")
         inst.setdefault("servername", f"Server{i}")
+        inst["type"] = str(inst.get("type") or "emby").lower()
+        if inst["type"] not in SERVER_TYPES:
+            raise ConfigError(f"Instanz {i} ({inst['servername']}): type muss {' oder '.join(SERVER_TYPES)} sein")
         if not inst["url"] or not inst.get("api_key"):
             raise ConfigError(f"Instanz {i} ({inst.get('servername')}): url oder api_key fehlt")
         # Pro-Instanz-Mappings (README v6) und globale Mappings zusammenführen
@@ -242,19 +245,33 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(clean, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-# --------------------------------------------------------------------------- Emby API
-class EmbyApi:
-    """Minimaler Emby-Client auf urllib-Basis. API-Key geht als Header X-Emby-Token, nicht in die URL."""
+# --------------------------------------------------------------------------- Medienserver-API
+SERVER_TYPES = ("emby", "jellyfin")
 
-    def __init__(self, url, api_key, timeout=10):
+
+class MediaServerApi:
+    """Minimaler Emby-/Jellyfin-Client auf urllib-Basis. API-Key geht als Header, nicht in die URL.
+    Emby: X-Emby-Token. Jellyfin: Authorization: MediaBrowser Token="..." (X-Emby-Token ist dort Legacy).
+    Unterschiedliche Endpunkte kapseln user_items() und resume_items()."""
+
+    def __init__(self, url, api_key, timeout=10, server_type="emby"):
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.type = (server_type or "emby").lower()
+        if self.type == "jellyfin":
+            self.headers = {"Authorization": f'MediaBrowser Token="{api_key}"', "Accept": "application/json"}
+        else:
+            self.headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+
+    @classmethod
+    def for_instance(cls, inst, timeout):
+        return cls(inst["url"], inst["api_key"], timeout, inst.get("type", "emby"))
 
     def get(self, path, **params):
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         full = f"{self.url}{path}" + (f"?{query}" if query else "")
-        req = urllib.request.Request(full, headers={"X-Emby-Token": self.api_key, "Accept": "application/json"})
+        req = urllib.request.Request(full, headers=self.headers)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8") or "null")
@@ -268,6 +285,18 @@ class EmbyApi:
         if isinstance(data, dict):
             return data.get("Items", [])
         return data or []
+
+    def user_items(self, uid, **params):
+        """Items aus Sicht eines Benutzers. Jellyfin (ab 10.9): /Items?userId=..., Emby: /Users/{uid}/Items."""
+        if self.type == "jellyfin":
+            return self.items("/Items", userId=uid, **params)
+        return self.items(f"/Users/{uid}/Items", **params)
+
+    def resume_items(self, uid, **params):
+        """«Weiterschauen». Jellyfin (ab 10.9): /UserItems/Resume?userId=..., Emby: /Users/{uid}/Items/Resume."""
+        if self.type == "jellyfin":
+            return self.items("/UserItems/Resume", userId=uid, **params)
+        return self.items(f"/Users/{uid}/Items/Resume", **params)
 
 
 # --------------------------------------------------------------------------- Pfade
@@ -706,7 +735,7 @@ def collect_sessions(cfg, log):
     rels, names = set(), set()
     ok = True
     for inst in cfg["instances"]:
-        api = EmbyApi(inst["url"], inst["api_key"], cfg["api_timeout"])
+        api = MediaServerApi.for_instance(inst, cfg["api_timeout"])
         loc = Locations(cfg, inst["_mappings"])
         try:
             sessions = api.get("/Sessions") or []

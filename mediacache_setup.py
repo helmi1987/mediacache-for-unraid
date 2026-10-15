@@ -5,7 +5,7 @@ MediaCache – interaktiver Konfigurator. Legt mediacache_settings.json an oder 
 Aufruf:  python3 mediacache_setup.py
 Ort der Settings: $MEDIACACHE_CONFIG bzw. $MEDIACACHE_DIR/mediacache_settings.json (Default: Script-Verzeichnis)
 
-Fragt Emby-Instanzen (URL, API-Key) ab, liest Bibliotheken und Benutzer von jeder Instanz, schlägt Host-Pfade
+Fragt Medienserver-Instanzen (Typ Emby/Jellyfin, URL, API-Key) ab, liest Bibliotheken und Benutzer von jeder Instanz, schlägt Host-Pfade
 für die Docker-Pfade vor und schreibt alle Systemwerte (Cache/Array-Pfade, Limits, Freiplatz).
 Alle Werte lassen sich später auch direkt in der JSON ändern; Schlüssel und Defaults stehen in mediacache_lib.DEFAULTS.
 """
@@ -13,9 +13,9 @@ import copy
 import json
 import sys
 
-from mediacache_lib import CONFIG_FILE, DEFAULTS, EmbyApi, save_config
+from mediacache_lib import CONFIG_FILE, DEFAULTS, SERVER_TYPES, MediaServerApi, save_config
 
-# Emby-interne Pfade, die nie Medien sind
+# Server-interne Pfade (Emby/Jellyfin), die nie Medien sind
 IGNORED_PREFIXES = ("/config", "/metadata", "/transcoding-temp", "/cache", "/logs", "/var", "/boot", "/tmp")
 
 
@@ -43,7 +43,7 @@ def suggest_mapping(internal_path, user_path):
 
 def read_instance(inst, timeout):
     """Bibliotheken (Name -> Docker-Pfade) und Benutzer (Id -> Name) einer Instanz."""
-    api = EmbyApi(inst["url"], inst["api_key"], timeout)
+    api = MediaServerApi.for_instance(inst, timeout)
     libs, users = {}, {}
     for lib in api.get("/Library/VirtualFolders") or []:
         locs = [l for l in lib.get("Locations", []) if not l.startswith(IGNORED_PREFIXES)]
@@ -65,16 +65,21 @@ def setup():
     for key, val in DEFAULTS.items():
         cfg.setdefault(key, copy.deepcopy(val))
 
-    print("\n--- 1. Emby Server ---")
+    print("\n--- 1. Medienserver (Emby / Jellyfin) ---")
     if not cfg["instances"]:
-        cfg["instances"] = [{"servername": "Emby", "url": "http://IP:8096", "api_key": ""}]
+        cfg["instances"] = [{"servername": "Server1", "url": "http://IP:8096", "api_key": ""}]
     count = ask_int("Anzahl Instanzen", len(cfg["instances"]))
     while len(cfg["instances"]) < count:
-        cfg["instances"].append({"servername": f"Emby{len(cfg['instances']) + 1}", "url": "http://IP:8096", "api_key": ""})
+        cfg["instances"].append({"servername": f"Server{len(cfg['instances']) + 1}", "url": "http://IP:8096", "api_key": ""})
     cfg["instances"] = cfg["instances"][:count]
     for i, inst in enumerate(cfg["instances"], 1):
         print(f"   Server {i}:")
-        inst["servername"] = ask("   Name", inst.get("servername", f"Emby{i}"))
+        inst["servername"] = ask("   Name", inst.get("servername", f"Server{i}"))
+        while True:
+            inst["type"] = ask(f"   Typ ({'/'.join(SERVER_TYPES)})", inst.get("type", "emby")).lower()
+            if inst["type"] in SERVER_TYPES:
+                break
+            print(f"   Erlaubt: {', '.join(SERVER_TYPES)}")
         inst["url"] = ask("   URL", inst.get("url", "")).rstrip("/")
         inst["api_key"] = ask("   API Key", inst.get("api_key", ""))
 

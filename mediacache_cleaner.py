@@ -23,7 +23,7 @@ from mediacache_lib import (
     read_exclude, remove_empty_parents, run_mover, run_rsync, setup_logging, share_mode_ok, write_exclude,
 )
 
-log = setup_logging("EmbyCleaner", "mediacache_cleaner.log")
+log = setup_logging("MediaCleaner", "mediacache_cleaner.log")
 
 
 def scan_orphans(cfg, exclude, sessions):

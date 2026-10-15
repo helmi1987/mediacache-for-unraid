@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MediaCache – holt «Weiterschauen»-Inhalte, die nächsten Folgen und Favoriten-Serien der Emby-Benutzer
+MediaCache – holt «Weiterschauen»-Inhalte, die nächsten Folgen und Favoriten-Serien der Emby-/Jellyfin-Benutzer
 vom Unraid-Array auf den Cache-Pool und räumt nicht mehr benötigte Dateien wieder aufs Array.
 
 Ablauf pro Lauf:
@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 from mediacache_lib import (
-    ConfigError, EmbyApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, free_percent_after,
+    ConfigError, MediaServerApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, free_percent_after,
     human, is_playing, load_config, read_exclude, remove_empty_parents, run_mover, run_rsync, setup_logging,
     share_mode_ok, summarize_mover_output, unraid_mover_running, write_exclude, EXCLUDE_FILE,
     __version__,
@@ -115,7 +115,7 @@ SOURCE_ORDER = ("Weiterschauen", "Als Nächstes", "Nächste Folge", "Favorit")
 
 
 def ep_label(ep):
-    """«S02E03 Titel» – oder nur der Titel, wenn Emby keine Nummern liefert."""
+    """«S02E03 Titel» – oder nur der Titel, wenn der Server keine Nummern liefert."""
     s, e = ep.get("ParentIndexNumber"), ep.get("IndexNumber")
     name = ep.get("Name", "?")
     return f"S{s:02d}E{e:02d} {name}" if s is not None and e is not None else name
@@ -148,7 +148,7 @@ class Planner:
 
     # ------------------------------------------------------------------ Dateien eines Items
     def files_for_item(self, loc, item):
-        """Ermittelt alle Dateien (relativ zur Share-Ebene), die zu einem Emby-Item gehören."""
+        """Ermittelt alle Dateien (relativ zur Share-Ebene), die zu einem Server-Item gehören."""
         raw = item.get("Path") or ""
         if not raw or item.get("LocationType") == "Virtual":
             return []
@@ -186,14 +186,14 @@ class Planner:
             files.append(OnDeckFile(rel, size, on_cache, reason))
         return Group(files, category, chain, source, series, title, reason) if files else None
 
-    # ------------------------------------------------------------------ Emby-Abfragen
+    # ------------------------------------------------------------------ Server-Abfragen
     @staticmethod
     def ep_key(ep):
         return (ep.get("ParentIndexNumber") if ep.get("ParentIndexNumber") is not None else -1,
                 ep.get("IndexNumber") if ep.get("IndexNumber") is not None else -1)
 
     def series_episodes(self, api, uid, series_id):
-        eps = api.items(f"/Users/{uid}/Items", ParentId=series_id, Recursive="true", IncludeItemTypes="Episode",
+        eps = api.user_items(uid, ParentId=series_id, Recursive="true", IncludeItemTypes="Episode",
                         SortBy="ParentIndexNumber,IndexNumber", SortOrder="Ascending",
                         Fields="Path,ParentIndexNumber,IndexNumber,LocationType")
         eps = [e for e in eps if e.get("Path") and e.get("LocationType") != "Virtual"]
@@ -231,7 +231,7 @@ class Planner:
     def plan_user(self, api, loc, name, uid, uname):
         up = UserPlan(f"{name}:{uid}", uname, uid, name)
         try:
-            resume = api.items(f"/Users/{uid}/Items/Resume", MediaTypes="Video", Limit=int(self.cfg["max_resume_items"]),
+            resume = api.resume_items(uid, MediaTypes="Video", Limit=int(self.cfg["max_resume_items"]),
                                Fields="Path,SeriesId,ParentIndexNumber,IndexNumber,LocationType")
         except RuntimeError as e:
             self.errors += 1; log.error(f"[{name}] Resume-Liste von {uname} nicht abrufbar: {e}")
@@ -299,7 +299,7 @@ class Planner:
         max_fav = int(self.cfg["max_favorite_series"])
         if max_fav > 0:
             try:
-                favs = api.items(f"/Users/{uid}/Items", Recursive="true", IncludeItemTypes="Series",
+                favs = api.user_items(uid, Recursive="true", IncludeItemTypes="Series",
                                  Filters="IsFavorite", Limit=max_fav, Fields="Path")
             except RuntimeError as e:
                 self.errors += 1; log.error(f"[{name}] Favoriten von {uname} nicht abrufbar: {e}")
@@ -331,7 +331,7 @@ class Planner:
         self.users[up.key] = up
 
     def plan_instance(self, inst, uids):
-        api = EmbyApi(inst["url"], inst["api_key"], self.cfg["api_timeout"])
+        api = MediaServerApi.for_instance(inst, self.cfg["api_timeout"])
         loc = Locations(self.cfg, inst["_mappings"])
         name = inst["servername"]
         if not uids:
@@ -428,7 +428,7 @@ class Planner:
             if wanted:
                 # Namen für die Log-Ausgabe auflösen; unbekannte IDs (z.B. andere Instanz) still überspringen
                 try:
-                    known = {u["Id"]: u.get("Name", u["Id"]) for u in EmbyApi(inst["url"], inst["api_key"], self.cfg["api_timeout"]).get("/Users") or []}
+                    known = {u["Id"]: u.get("Name", u["Id"]) for u in MediaServerApi.for_instance(inst, self.cfg["api_timeout"]).get("/Users") or []}
                 except RuntimeError as e:
                     self.errors += 1; log.error(f"[{inst['servername']}] nicht erreichbar: {e}")
                     continue
@@ -969,7 +969,7 @@ class Runner:
         protected = set()
         try:
             if planner.errors or not sessions_ok:
-                log.warning("Planung unvollständig (Emby nicht vollständig erreichbar) – Cleanup wird übersprungen, "
+                log.warning("Planung unvollständig (Medienserver nicht vollständig erreichbar) – Cleanup wird übersprungen, "
                             "bisherige Exclude-Liste bleibt geschützt")
                 protected.update(p for p in read_exclude() if Path(p).exists())
             else:
