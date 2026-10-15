@@ -269,7 +269,7 @@ class Planner:
         # noch nicht läuft – ohne diese Quelle fiele die Serie zwischen zwei Folgen aus dem Cache
         if self.cfg["use_next_up"]:
             try:
-                nextup = api.items("/Shows/NextUp", UserId=uid, Limit=int(self.cfg["max_resume_items"]),
+                nextup = api.next_up(uid, Limit=int(self.cfg["max_resume_items"]),
                                    Fields="Path,SeriesId,ParentIndexNumber,IndexNumber,LocationType")
             except RuntimeError as e:
                 self.errors += 1; log.error(f"[{name}] NextUp-Liste von {uname} nicht abrufbar: {e}")
@@ -336,7 +336,7 @@ class Planner:
         name = inst["servername"]
         if not uids:
             try:
-                users = api.get("/Users") or []
+                users = api.users()
             except RuntimeError as e:
                 self.errors += 1; log.error(f"[{name}] Benutzerliste nicht abrufbar: {e}")
                 return
@@ -428,7 +428,7 @@ class Planner:
             if wanted:
                 # Namen für die Log-Ausgabe auflösen; unbekannte IDs (z.B. andere Instanz) still überspringen
                 try:
-                    known = {u["Id"]: u.get("Name", u["Id"]) for u in MediaServerApi.for_instance(inst, self.cfg["api_timeout"]).get("/Users") or []}
+                    known = {u["Id"]: u.get("Name", u["Id"]) for u in MediaServerApi.for_instance(inst, self.cfg["api_timeout"]).users()}
                 except RuntimeError as e:
                     self.errors += 1; log.error(f"[{inst['servername']}] nicht erreichbar: {e}")
                     continue

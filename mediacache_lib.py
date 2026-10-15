@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -196,6 +197,11 @@ def load_config(require_paths=True):
         inst["type"] = str(inst.get("type") or "emby").lower()
         if inst["type"] not in SERVER_TYPES:
             raise ConfigError(f"Instanz {i} ({inst['servername']}): type muss {' oder '.join(SERVER_TYPES)} sein")
+        if inst["type"] == "plex":
+            try:
+                inst["days_to_monitor"] = int(inst.get("days_to_monitor", 99))
+            except (TypeError, ValueError):
+                raise ConfigError(f"Instanz {i} ({inst['servername']}): days_to_monitor muss eine ganze Zahl sein")
         if not inst["url"] or not inst.get("api_key"):
             raise ConfigError(f"Instanz {i} ({inst.get('servername')}): url oder api_key fehlt")
         # Pro-Instanz-Mappings (README v6) und globale Mappings zusammenführen
@@ -246,7 +252,7 @@ def save_config(cfg):
 
 
 # --------------------------------------------------------------------------- Medienserver-API
-SERVER_TYPES = ("emby", "jellyfin")
+SERVER_TYPES = ("emby", "jellyfin", "plex")
 
 
 class MediaServerApi:
@@ -266,6 +272,9 @@ class MediaServerApi:
 
     @classmethod
     def for_instance(cls, inst, timeout):
+        """Passenden Client für eine Instanz: PlexApi für type=plex, sonst Emby/Jellyfin."""
+        if inst.get("type") == "plex":
+            return PlexApi(inst["url"], inst["api_key"], timeout, int(inst.get("days_to_monitor", 99)))
         return cls(inst["url"], inst["api_key"], timeout, inst.get("type", "emby"))
 
     def get(self, path, **params):
@@ -297,6 +306,146 @@ class MediaServerApi:
         if self.type == "jellyfin":
             return self.items("/UserItems/Resume", userId=uid, **params)
         return self.items(f"/Users/{uid}/Items/Resume", **params)
+
+    def next_up(self, uid, **params):
+        return self.items("/Shows/NextUp", UserId=uid, **params)
+
+    def users(self):
+        """[{"Id", "Name"}]"""
+        return self.get("/Users") or []
+
+    def sessions(self):
+        """[{"NowPlayingItem": {"Path"}, "UserName"}]"""
+        return self.get("/Sessions") or []
+
+    def libraries(self):
+        """[{"Name", "Locations": [Docker-Pfade]}]"""
+        return self.get("/Library/VirtualFolders") or []
+
+
+class PlexApi:
+    """Plex-Client mit derselben Schnittstelle wie MediaServerApi. Liefert Items im Emby-Format
+    (Id, Type, Name, Path, SeriesId, SeriesName, ParentIndexNumber, IndexNumber, UserData.Played),
+    damit die Planung unverändert bleibt.
+
+    Logik wie PlexCache (github.com/bexem/PlexCache): Quelle ist On Deck (/library/onDeck) pro Benutzer,
+    gefiltert auf lastViewedAt <= days_to_monitor Tage; danach die nächsten Folgen in Serienreihenfolge.
+    Benutzer: Admin (Token der Instanz) plus alle Benutzer, mit denen der Server geteilt ist
+    (Token via plex.tv shared_servers, wie plexapi MyPlexUser.get_token). Plex hat keine Favoriten
+    und kein separates NextUp (steckt im On Deck) – beide liefern leere Listen."""
+
+    PLEX_TV = "https://plex.tv"
+
+    def __init__(self, url, api_key, timeout=10, days_to_monitor=99):
+        self.url = url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.days_to_monitor = days_to_monitor
+        self._tokens = None   # uid -> Server-Token des Benutzers
+        self._names = {}
+
+    def _request(self, full, token, accept_json=True):
+        headers = {"X-Plex-Token": token, "X-Plex-Client-Identifier": "mediacache", "X-Plex-Product": "MediaCache"}
+        if accept_json:
+            headers["Accept"] = "application/json"
+        req = urllib.request.Request(full, headers=headers)
+        path = urllib.parse.urlsplit(full).path
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code} bei {path}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise RuntimeError(f"{path} nicht erreichbar: {e}") from e
+        return json.loads(body or "null") if accept_json else body
+
+    def get(self, path, token=None, **params):
+        query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        data = self._request(f"{self.url}{path}" + (f"?{query}" if query else ""), token or self.api_key)
+        return (data or {}).get("MediaContainer") or {}
+
+    # ------------------------------------------------------------------ Benutzer
+    def _load_users(self):
+        if self._tokens is not None:
+            return
+        tokens, names = {}, {}
+        acc = self._request(f"{self.PLEX_TV}/api/v2/user", self.api_key) or {}
+        admin_id = str(acc.get("id") or "admin")
+        tokens[admin_id] = self.api_key
+        names[admin_id] = acc.get("title") or acc.get("username") or "Admin"
+        mid = self.get("/").get("machineIdentifier")
+        if mid:
+            xml = self._request(f"{self.PLEX_TV}/api/servers/{mid}/shared_servers", self.api_key, accept_json=False)
+            for s in ET.fromstring(xml).iter("SharedServer"):
+                uid, tok = s.get("userID"), s.get("accessToken")
+                if uid and tok:
+                    tokens[str(uid)] = tok
+                    names[str(uid)] = s.get("username") or s.get("email") or str(uid)
+        self._tokens, self._names = tokens, names
+
+    def users(self):
+        self._load_users()
+        return [{"Id": uid, "Name": self._names.get(uid, uid)} for uid in self._tokens]
+
+    def _token(self, uid):
+        self._load_users()
+        tok = self._tokens.get(str(uid))
+        if not tok:
+            raise RuntimeError(f"Kein Plex-Token für Benutzer {uid} (Server nicht mit ihm geteilt?)")
+        return tok
+
+    # ------------------------------------------------------------------ Items
+    @staticmethod
+    def _path(meta):
+        for media in meta.get("Media") or []:
+            for part in media.get("Part") or []:
+                if part.get("file"):
+                    return part["file"]
+        return ""
+
+    def _convert(self, meta):
+        typ = meta.get("type")
+        item = {"Id": str(meta.get("ratingKey", "")), "Name": meta.get("title", "?"), "Path": self._path(meta),
+                "UserData": {"Played": bool(meta.get("viewCount"))}}
+        if typ == "movie":
+            item["Type"] = "Movie"
+        elif typ == "episode":
+            item.update({"Type": "Episode", "SeriesId": str(meta.get("grandparentRatingKey") or ""),
+                         "SeriesName": meta.get("grandparentTitle", "?"),
+                         "ParentIndexNumber": meta.get("parentIndex"), "IndexNumber": meta.get("index")})
+        elif typ == "show":
+            item["Type"] = "Series"
+        else:
+            item["Type"] = str(typ or "")
+        return item
+
+    def resume_items(self, uid, Limit=None, **_):
+        """On Deck des Benutzers, nur Einträge der letzten days_to_monitor Tage (wie PlexCache)."""
+        meta = self.get("/library/onDeck", token=self._token(uid)).get("Metadata") or []
+        cutoff = time.time() - self.days_to_monitor * 86400
+        out = [self._convert(m) for m in meta
+               if m.get("type") in ("movie", "episode") and (m.get("lastViewedAt") or 0) >= cutoff]
+        return out[:int(Limit)] if Limit else out
+
+    def user_items(self, uid, ParentId=None, IncludeItemTypes=None, **_):
+        """Nur Episoden einer Serie (/library/metadata/{id}/allLeaves). Favoriten-Serien gibt es in Plex nicht."""
+        if IncludeItemTypes != "Episode" or not ParentId:
+            return []
+        meta = self.get(f"/library/metadata/{ParentId}/allLeaves", token=self._token(uid)).get("Metadata") or []
+        return [self._convert(m) for m in meta]
+
+    def next_up(self, uid, **_):
+        return []
+
+    def sessions(self):
+        out = []
+        for m in self.get("/status/sessions").get("Metadata") or []:
+            out.append({"NowPlayingItem": {"Path": self._path(m)}, "UserName": (m.get("User") or {}).get("title", "?")})
+        return out
+
+    def libraries(self):
+        return [{"Name": d.get("title", "?"), "Locations": [l.get("path") for l in d.get("Location") or [] if l.get("path")]}
+                for d in self.get("/library/sections").get("Directory") or [] if d.get("type") in ("movie", "show")]
 
 
 # --------------------------------------------------------------------------- Pfade
@@ -738,7 +887,7 @@ def collect_sessions(cfg, log):
         api = MediaServerApi.for_instance(inst, cfg["api_timeout"])
         loc = Locations(cfg, inst["_mappings"])
         try:
-            sessions = api.get("/Sessions") or []
+            sessions = api.sessions()
         except RuntimeError as e:
             log.warning(f"[{inst['servername']}] Sessions nicht abrufbar: {e}")
             ok = False

@@ -1,8 +1,10 @@
 # 🎬 MediaCache für Unraid
 
-Für **Emby** und **Jellyfin** (pro Instanz `type`), auch gemischt. Jellyfin ab 10.9 (neue Endpunkte `/Items?userId=`, `/UserItems/Resume`, Auth-Header `Authorization: MediaBrowser Token="…"`).
+Für **Emby**, **Jellyfin** und **Plex** (pro Instanz `type`), auch gemischt. Jellyfin ab 10.9 (neue Endpunkte `/Items?userId=`, `/UserItems/Resume`, Auth-Header `Authorization: MediaBrowser Token="…"`).
 
-Verschiebt die Medien, die Emby- und Jellyfin-Benutzer als Nächstes sehen werden («Weiterschauen», die nächsten Folgen, Favoriten-Serien), vom Array auf den Cache-Pool und räumt sie wieder aufs Array, sobald sie nicht mehr gebraucht werden. Die Array-Platten können dadurch schlafen, und die Wiedergabe startet ohne Spin-up.
+**Plex** (Logik wie [PlexCache](https://github.com/bexem/PlexCache)): Quelle ist **On Deck** pro Benutzer, nur Einträge, die in den letzten `days_to_monitor` Tagen (Default 99) geschaut wurden; dazu die nächsten Folgen in Serienreihenfolge (`number_episodes` / `cache_budget` wie bei Emby). `api_key` = X-Plex-Token des Admins. Benutzer = Admin plus alle Benutzer, mit denen der Server geteilt ist (Token über plex.tv). Plex kennt keine Favoriten und kein separates «Als Nächstes» – beides entfällt dort. Bei mehrteiligen Medien zählt der erste Part (im `movie_mode: folder` wird der ganze Ordner genommen).
+
+Verschiebt die Medien, die Emby-, Jellyfin- und Plex-Benutzer als Nächstes sehen werden («Weiterschauen», die nächsten Folgen, Favoriten-Serien), vom Array auf den Cache-Pool und räumt sie wieder aufs Array, sobald sie nicht mehr gebraucht werden. Die Array-Platten können dadurch schlafen, und die Wiedergabe startet ohne Spin-up.
 
 Der Medienserver merkt davon nichts, weil er die Medien über `/mnt/user/...` sieht – egal ob eine Datei gerade auf dem Pool oder auf einer Array-Disk liegt.
 
@@ -39,7 +41,7 @@ Ist ein Medienserver nicht (vollständig) erreichbar, wird der Cleanup überspru
 | `mediacache_setup.py` | Interaktiver Konfigurator: Instanzen, Bibliotheken, Pfad-Mapping, Benutzer, Systemwerte |
 | `mediacache_run.py` | Hauptscript (Report / Dry-Run / Run) |
 | `mediacache_cleaner.py` | Findet Dateien auf dem Cache, die nicht in der Exclude-Liste stehen (Waisen), und räumt sie auf Wunsch weg |
-| `mediacache_lib.py` | Gemeinsamer Code (Config, Pfade, Emby-/Jellyfin-API, Mover, Lock, Logging) |
+| `mediacache_lib.py` | Gemeinsamer Code (Config, Pfade, Emby-/Jellyfin-/Plex-API, Mover, Lock, Logging) |
 | `mediacache_settings.json` | Konfiguration (siehe unten) |
 | `mediacache_exclude.txt` | Aktuell gecachte Dateien; wird atomar geschrieben (über `mediacache_exclude.tmp`) |
 | `mediacache.lock` | Verhindert parallele Läufe |
@@ -61,7 +63,7 @@ Alle Pfade sind relativ zum **Script-Verzeichnis**, nicht zum Arbeitsverzeichnis
     "instances": [
         {
             "servername": "Nostromo",
-            "type": "emby",                    // emby | jellyfin (Default: emby)
+            "type": "emby",                    // emby | jellyfin | plex (Default: emby); bei plex optional "days_to_monitor": 99
             "url": "http://192.168.7.10:8096",
             "api_key": "…",
             "path_mappings": {                 // Docker-Pfad -> Host-Pfad, nur gecachte Bibliotheken
@@ -196,7 +198,7 @@ Pro Benutzer zuerst die Filme, dann jede Serie als Block mit ihren Folgen in Rei
 
 **Array → Cache über den Unraid-Mover (`fill_tool: mover`).** Der Stock-Mover bringt Dateien von «prefer»-Shares mit `find /mnt/user0/<share> | move` auf den Pool; das Script übergibt dem Binary dieselben Pfade (bevorzugt den echten `/mnt/diskN`-Pfad). Welchen Pool das Binary nimmt, steht in der Share-Konfiguration – für einen Share auf *Array only* gibt es keinen, dann bleibt die Datei liegen und das Script meldet es. Deshalb: mit `mover_debug_level: 1` und einer einzelnen Datei testen, bevor du umstellst. Vorteil gegenüber rsync: fuser-Check und keine doppelte Datei bei Abbruch. Nachteil: kein paralleles Kopieren. Das Werkzeug für den Cleanup (Cache → Array) wählt unabhängig davon `cleanup_tool`.
 
-**Server-Mounts.** Emby bzw. Jellyfin muss die Medien über `/mnt/user/...` sehen (nicht `/mnt/user0` oder `/mnt/diskN`), sonst bricht der transparente Wechsel zwischen Pool und Array.
+**Server-Mounts.** Emby, Jellyfin bzw. Plex muss die Medien über `/mnt/user/...` sehen (nicht `/mnt/user0` oder `/mnt/diskN`), sonst bricht der transparente Wechsel zwischen Pool und Array.
 
 **Hardlinks.** Sind Medien per Hardlink mit einem Download-Ordner verbunden (*arr-Setups), trennt rsync + löschen den Hardlink; nach dem Zurückschieben liegt die Datei doppelt.
 

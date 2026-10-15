@@ -45,11 +45,11 @@ def read_instance(inst, timeout):
     """Bibliotheken (Name -> Docker-Pfade) und Benutzer (Id -> Name) einer Instanz."""
     api = MediaServerApi.for_instance(inst, timeout)
     libs, users = {}, {}
-    for lib in api.get("/Library/VirtualFolders") or []:
+    for lib in api.libraries():
         locs = [l for l in lib.get("Locations", []) if not l.startswith(IGNORED_PREFIXES)]
         if locs:
             libs[lib["Name"]] = locs
-    for u in api.get("/Users") or []:
+    for u in api.users():
         users[u["Id"]] = u.get("Name", u["Id"])
     return libs, users
 
@@ -80,8 +80,16 @@ def setup():
             if inst["type"] in SERVER_TYPES:
                 break
             print(f"   Erlaubt: {', '.join(SERVER_TYPES)}")
-        inst["url"] = ask("   URL", inst.get("url", "")).rstrip("/")
-        inst["api_key"] = ask("   API Key", inst.get("api_key", ""))
+        plex = inst["type"] == "plex"
+        url = inst.get("url", "")
+        if plex and url.endswith(":8096"):
+            url = url[:-5] + ":32400"
+        inst["url"] = ask("   URL", url).rstrip("/")
+        inst["api_key"] = ask("   Plex-Token (X-Plex-Token des Admins)" if plex else "   API Key", inst.get("api_key", ""))
+        if plex:
+            inst["days_to_monitor"] = ask_int("   On Deck: nur Einträge der letzten N Tage", inst.get("days_to_monitor", 99))
+        else:
+            inst.pop("days_to_monitor", None)
 
     print("\n--- Lade Daten von den Instanzen ---")
     data = {}
