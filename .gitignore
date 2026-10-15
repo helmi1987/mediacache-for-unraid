@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+logs/
+mediacache_settings.json
+mediacache_exclude.txt
+mediacache_exclude.tmp
+mediacache.lock
+mediacache_status.json
+mediacache_status.tmp
