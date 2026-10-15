@@ -357,7 +357,12 @@ class PlexApi:
             raise RuntimeError(f"HTTP {e.code} bei {path}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise RuntimeError(f"{path} nicht erreichbar: {e}") from e
-        return json.loads(body or "null") if accept_json else body
+        if not accept_json:
+            return body
+        try:
+            return json.loads(body or "null")
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Ungültige Antwort von {path}: {e}") from e
 
     def get(self, path, token=None, **params):
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -368,19 +373,23 @@ class PlexApi:
     def _load_users(self):
         if self._tokens is not None:
             return
-        tokens, names = {}, {}
-        acc = self._request(f"{self.PLEX_TV}/api/v2/user", self.api_key) or {}
-        admin_id = str(acc.get("id") or "admin")
-        tokens[admin_id] = self.api_key
-        names[admin_id] = acc.get("title") or acc.get("username") or "Admin"
-        mid = self.get("/").get("machineIdentifier")
-        if mid:
-            xml = self._request(f"{self.PLEX_TV}/api/servers/{mid}/shared_servers", self.api_key, accept_json=False)
-            for s in ET.fromstring(xml).iter("SharedServer"):
-                uid, tok = s.get("userID"), s.get("accessToken")
-                if uid and tok:
-                    tokens[str(uid)] = tok
-                    names[str(uid)] = s.get("username") or s.get("email") or str(uid)
+        # Ohne plex.tv (offline) bleibt nur der Admin mit dem Instanz-Token; Ergebnis wird so oder so gecacht
+        tokens, names = {"admin": self.api_key}, {"admin": "Admin"}
+        try:
+            acc = self._request(f"{self.PLEX_TV}/api/v2/user", self.api_key) or {}
+            admin_id = str(acc.get("id") or "admin")
+            tokens = {admin_id: self.api_key}
+            names = {admin_id: acc.get("title") or acc.get("username") or "Admin"}
+            mid = self.get("/").get("machineIdentifier")
+            if mid:
+                xml = self._request(f"{self.PLEX_TV}/api/servers/{mid}/shared_servers", self.api_key, accept_json=False)
+                for s in ET.fromstring(xml).iter("SharedServer"):
+                    uid, tok = str(s.get("userID") or ""), s.get("accessToken")
+                    if uid and tok and uid not in tokens:   # Admin behält sein eigenes Token
+                        tokens[uid] = tok
+                        names[uid] = s.get("username") or s.get("email") or uid
+        except (RuntimeError, ET.ParseError) as e:
+            logging.getLogger("MediaCache").warning(f"Plex-Benutzer über plex.tv nicht abrufbar ({e}) – nur Admin")
         self._tokens, self._names = tokens, names
 
     def users(self):
@@ -420,11 +429,12 @@ class PlexApi:
         return item
 
     def resume_items(self, uid, Limit=None, **_):
-        """On Deck des Benutzers, nur Einträge der letzten days_to_monitor Tage (wie PlexCache)."""
+        """On Deck des Benutzers, nur Einträge der letzten days_to_monitor Tage (wie PlexCache).
+        Einträge ohne lastViewedAt (nächste, noch ungesehene Folge) werden nicht gefiltert."""
         meta = self.get("/library/onDeck", token=self._token(uid)).get("Metadata") or []
         cutoff = time.time() - self.days_to_monitor * 86400
         out = [self._convert(m) for m in meta
-               if m.get("type") in ("movie", "episode") and (m.get("lastViewedAt") or 0) >= cutoff]
+               if m.get("type") in ("movie", "episode") and (m.get("lastViewedAt") is None or m["lastViewedAt"] >= cutoff)]
         return out[:int(Limit)] if Limit else out
 
     def user_items(self, uid, ParentId=None, IncludeItemTypes=None, **_):
