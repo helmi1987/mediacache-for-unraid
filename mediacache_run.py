@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 from mediacache_lib import (
-    ConfigError, MediaServerApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, free_percent_after,
+    ConfigError, MediaServerApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, free_percent_after, mkdir_like,
     human, is_playing, load_config, read_exclude, remove_empty_parents, run_mover, run_rsync, setup_logging,
     share_mode_ok, summarize_mover_output, unraid_mover_running, write_exclude, EXCLUDE_FILE,
     __version__,
@@ -490,7 +490,7 @@ class Runner:
                 log.warning(f"Ziel existiert schon auf dem Array (Duplikat?), Datei bleibt auf dem Cache: {rel}")
                 protected.add(p)
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            mkdir_like(dst.parent, src.parent)
             key = f"{i}:{rel}"
             log.info(f"[{i}/{len(candidates)}] -> ARRAY {human(sizes.get(p, 0)):>10}  {rel}")
             self.status.job_start(key, rel, "Array", sizes.get(p, 0), i)
@@ -624,7 +624,7 @@ class Runner:
                               f"(zfs create <pool>/{f.rel.parts[0]}) oder create_share_root=true setzen. Übersprungen: {f.rel}")
                     continue
                 if self.run_mode:
-                    share_root.mkdir(parents=True, exist_ok=True)
+                    mkdir_like(share_root, loc.array / f.rel.parts[0])
             # Dataset (Quota) und Pool-Wurzel prüfen – appdata liegt oft auf demselben Pool
             delta = self.sim_delta if not self.run_mode else -pending
             free_after = free_percent_after(loc.cache, f.size, delta)
@@ -728,7 +728,7 @@ class Runner:
         t0 = time.time()
         ok = False
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            mkdir_like(dst.parent, src.parent)
             cmd = self.rsync_cmd(src, dst)
             log.debug("rsync-Aufruf: " + " ".join(cmd))
             rc, out = run_rsync(cmd, lambda done, speed, eta: self.status.job_progress(key, done, speed, eta))

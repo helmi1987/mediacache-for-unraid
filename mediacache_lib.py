@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -525,6 +526,25 @@ class Locations:
                 if f.is_file():
                     found.add(f.relative_to(root))
         return sorted(found)
+
+
+def mkdir_like(dst_dir, src_dir):
+    """Legt dst_dir samt fehlender Elternordner an und übernimmt Owner, Gruppe und Rechte vom jeweils
+    entsprechenden Quellordner (gleiche relative Struktur). mkdir(parents=True) allein würde root:root
+    mit umask-Rechten erzeugen. Bestehende Ordner bleiben unverändert."""
+    missing = []
+    d, s = Path(dst_dir), Path(src_dir)
+    while not d.exists() and d != d.parent:
+        missing.append((d, s))
+        d, s = d.parent, s.parent
+    for d, s in reversed(missing):
+        d.mkdir(exist_ok=True)
+        try:
+            st = s.stat()
+            os.chown(d, st.st_uid, st.st_gid)
+            os.chmod(d, stat.S_IMODE(st.st_mode))
+        except OSError as e:
+            logging.getLogger("MediaCache").warning(f"Owner/Rechte für {d} nicht übernommen ({e})")
 
 
 def remove_empty_parents(path, stop_root, log, min_depth=2):
