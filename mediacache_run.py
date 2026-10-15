@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 from mediacache_lib import (
-    ConfigError, MediaServerApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, free_percent_after, mkdir_like,
+    ConfigError, MediaServerApi, Locations, Status, acquire_lock, format_status, collect_sessions, detect_mover_bin, ensure_share_root, free_percent_after, mkdir_like,
     human, is_playing, load_config, read_exclude, remove_empty_parents, run_mover, run_rsync, setup_logging,
     share_mode_ok, summarize_mover_output, unraid_mover_running, write_exclude, EXCLUDE_FILE,
     __version__,
@@ -611,6 +611,7 @@ class Runner:
         jobs = []  # (OnDeckFile, src, disk)
         pending = 0  # scharfer Lauf: Bytes, die die geplanten Kopien noch belegen werden
         last_group = None
+        share_roots = {}  # {share: bool} – Share-Wurzel einmal pro Lauf prüfen/anlegen
         for f in sorted(files, key=lambda x: str(x.rel)):
             if f.on_cache:
                 continue
@@ -618,13 +619,10 @@ class Runner:
                 log.info(f"[SKIP: läuft gerade] {f.rel}")
                 continue
             share_root = loc.cache / f.rel.parts[0]
-            if not share_root.is_dir():
-                if not self.cfg["create_share_root"]:
-                    log.error(f"Share-Wurzel {share_root} fehlt. Auf ZFS-Pools zuerst als Dataset anlegen "
-                              f"(zfs create <pool>/{f.rel.parts[0]}) oder create_share_root=true setzen. Übersprungen: {f.rel}")
-                    continue
-                if self.run_mode:
-                    mkdir_like(share_root, loc.array / f.rel.parts[0])
+            # ZFS: Dataset <pool>/<share> wie Unraid; btrfs/XFS: Ordner. Dry-Run meldet nur.
+            if not ensure_share_root(self.cfg, loc.cache, loc.array, f.rel.parts[0], self.run_mode, log, share_roots):
+                log.warning(f"[SKIP: Share-Wurzel] {f.rel}")
+                continue
             # Dataset (Quota) und Pool-Wurzel prüfen – appdata liegt oft auf demselben Pool
             delta = self.sim_delta if not self.run_mode else -pending
             free_after = free_percent_after(loc.cache, f.size, delta)

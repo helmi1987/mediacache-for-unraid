@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "7.3.0 (2026-10-09)"
+__version__ = "7.4.0 (2026-10-15)"
 
 BASE_DIR = Path(os.environ.get("MEDIACACHE_DIR") or Path(__file__).resolve().parent)
 CONFIG_FILE = Path(os.environ.get("MEDIACACHE_CONFIG") or (BASE_DIR / "mediacache_settings.json"))
@@ -44,6 +44,8 @@ LOG_DIR = BASE_DIR / "logs"
 
 MOVER_CANDIDATES = ["/usr/libexec/unraid/move", "/usr/local/sbin/move", "/usr/local/bin/move"]
 MOVER_PIDFILE = "/var/run/mover.pid"
+MOUNTS_FILE = "/proc/mounts"
+ZFS_BIN = "zfs"
 
 # Alle Config-Schlüssel mit Default. Unbekannte Schlüssel werden ignoriert, fehlende ergänzt.
 DEFAULTS = {
@@ -65,7 +67,8 @@ DEFAULTS = {
     "use_next_up": True,                 # Auch «Als Nächstes» des Servers (/Shows/NextUp) als Quelle – hält Serien zwischen zwei Folgen im Cache
     "min_free_percent": 20,              # Unter diesem Freiplatz (Prozent) wird nichts mehr auf den Cache kopiert
     "movie_mode": "folder",              # folder = ganzer Filmordner mitnehmen, file = nur Dateien mit gleichem Namen
-    "create_share_root": False,          # Share-Wurzel auf dem Pool automatisch anlegen (ZFS: besser vorher als Dataset!)
+    "create_share_root": True,           # Fehlende Share-Wurzel auf dem Pool anlegen: ZFS = Dataset <pool>/<share> (wie Unraid),
+                                         #   btrfs/XFS = Ordner; false = Dateien solcher Shares überspringen
     "mover_bin": "",                     # Leer = automatisch erkennen
     "mover_debug_level": 0,              # Parameter -d für das move-Binary (0 = still, 1..3 = ausführlicher)
     "rsync_args": ["-aAX", "--numeric-ids"],  # Vollständige rsync-Optionen (Default = wie das Original)
@@ -239,6 +242,7 @@ def load_config(require_paths=True):
         if cfg[key] < minimum:
             raise ConfigError(f"{key} muss mindestens {minimum} sein")
     cfg["copy_progress"] = bool(cfg["copy_progress"])
+    cfg["create_share_root"] = bool(cfg["create_share_root"])
     if not cfg["rsync_args"]:
         raise ConfigError("rsync_args darf nicht leer sein (Original: [\"-aAX\", \"--numeric-ids\"])")
     return cfg
@@ -650,6 +654,164 @@ def share_mode_ok(cfg, share, checked, log):
                   f"Cleanup für diesen Share übersprungen (Alternative: cleanup_tool=rsync).")
         checked[share] = False
     return checked[share]
+
+
+# --------------------------------------------------------------------------- Share-Wurzel / ZFS
+def _unescape_mount(field):
+    """/proc/mounts kodiert Leerzeichen, Tab, Newline und Backslash oktal (\\040 usw.)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def read_mounts():
+    """[(source, mountpoint, fstype)] aus /proc/mounts; leer, wenn nicht lesbar."""
+    try:
+        text = Path(MOUNTS_FILE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out.append((_unescape_mount(parts[0]), _unescape_mount(parts[1]), parts[2]))
+    return out
+
+
+def mount_of(path, mounts=None):
+    """Mount-Eintrag (source, mountpoint, fstype), unter dem path liegt (längster Mountpoint-Prefix), oder None.
+    Bei mehrfach gemounteten Pfaden gilt der letzte Eintrag (wie im Kernel)."""
+    p = str(path).rstrip("/") or "/"
+    best = None
+    for src, mp, fs in (read_mounts() if mounts is None else mounts):
+        mpn = mp.rstrip("/") or "/"
+        if p == mpn or p.startswith(mpn.rstrip("/") + "/"):
+            if best is None or len(mpn) >= len(best[1].rstrip("/") or "/"):
+                best = (src, mp, fs)
+    return best
+
+
+def zfs_dataset_exists(name):
+    """True, wenn `zfs list` das Dataset kennt."""
+    try:
+        r = subprocess.run([ZFS_BIN, "list", "-H", "-o", "name", name], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == name
+
+
+def zfs_create(name):
+    """`zfs create <name>` – Eigenschaften (auch mountpoint) werden vom Pool geerbt, wie bei Unraids shfs.
+    Gibt (ok, meldung) zurück."""
+    try:
+        r = subprocess.run([ZFS_BIN, "create", name], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def copy_owner_mode(dst, src, log):
+    """Owner, Gruppe und Rechte von src auf dst übernehmen (wie mkdir_like für einen bestehenden Ordner)."""
+    try:
+        st = Path(src).stat()
+        os.chown(dst, st.st_uid, st.st_gid)
+        os.chmod(dst, stat.S_IMODE(st.st_mode))
+    except OSError as e:
+        log.warning(f"Owner/Rechte für {dst} nicht übernommen ({e})")
+
+
+SHARE_ROOT_OK_MODES = ("yes", "prefer", "only")
+
+
+def ensure_share_root(cfg, cache, array, share, run_mode, log, state):
+    """Sorgt dafür, dass die Share-Wurzel /mnt/<pool>/<share> auf dem Pool existiert, so wie Unraid sie anlegt.
+      ZFS:       fehlt sie, wird das Dataset <pool-dataset>/<share> angelegt (zfs create, Eigenschaften geerbt), danach
+                 Owner/Rechte wie /mnt/user0/<share>. Ein bestehender normaler Ordner wird nie umgebaut – nur einmal gewarnt.
+                 Angelegt wird nur, wenn der Share laut Share-Einstellung auf diesen Pool darf (shareCachePool = Pool,
+                 shareUseCache yes/prefer/only).
+      btrfs/XFS: mkdir_like (Unraid legt dort auch nur einen Ordner an).
+    Nie zfs destroy/rename, nie bestehende Daten anfassen. Im Dry-Run wird nur gemeldet.
+    state: dict pro Lauf ({share: True/False}), damit jede Meldung nur einmal erscheint.
+    Rückgabe: True = Wurzel existiert (Dry-Run: würde angelegt), False = Dateien dieses Shares überspringen."""
+    if share in state:
+        return state[share]
+    cache, array = Path(cache), Path(array)
+    root = cache / share
+    mounts = read_mounts()
+    pool_mount = mount_of(cache, mounts)
+    fstype = pool_mount[2] if pool_mount else "?"
+
+    if root.is_dir():
+        if fstype == "zfs":
+            own = mount_of(root, mounts)
+            if not own or own[2] != "zfs" or (own[1].rstrip("/") != str(root).rstrip("/")):
+                dataset = f"{pool_mount[0]}/{share}"
+                if zfs_dataset_exists(dataset):
+                    log.error(f"Dataset {dataset} existiert, ist aber nicht unter {root} eingehängt – Kopien landeten im "
+                              f"Pool-Dataset statt im Share-Dataset. MediaCache ändert daran nichts (zfs mount prüfen), "
+                              f"Dateien des Shares «{share}» übersprungen")
+                    state[share] = False
+                    return False
+                log.warning(f"Share-Wurzel {root} ist auf dem ZFS-Pool ein normaler Ordner im Dataset "
+                            f"{pool_mount[0]}, kein eigenes Dataset (keine eigenen Snapshots/Quota/Backups je Share; "
+                            f"Unraid wandelt ihn nie um). MediaCache baut nichts um. Lösung: den Teil des Shares auf "
+                            f"{cache} leeren lassen (Mover bzw. MediaCache-Cleanup) und den leeren Ordner entfernen – "
+                            f"der nächste Lauf legt dann das Dataset {pool_mount[0]}/{share} an.")
+        state[share] = True
+        return True
+
+    if not cfg.get("create_share_root", True):
+        log.error(f"Share-Wurzel {root} fehlt und create_share_root=false – Dateien des Shares «{share}» übersprungen")
+        state[share] = False
+        return False
+
+    if fstype not in ("zfs", "btrfs", "xfs"):
+        log.error(f"Dateisystem von {cache} unbekannt ({fstype}; Pool nicht eingehängt oder {MOUNTS_FILE} nicht lesbar) – "
+                  f"Share-Wurzel {root} nicht angelegt, Dateien des Shares «{share}» übersprungen")
+        state[share] = False
+        return False
+    if fstype != "zfs":
+        if run_mode:
+            mkdir_like(root, array / share)
+            log.info(f"Share-Wurzel als Ordner angelegt ({fstype}): {root}")
+        else:
+            log.info(f"PLAN: würde Ordner {root} anlegen ({fstype})")
+        state[share] = True
+        return True
+
+    pool = cache.name
+    mode, primary, _secondary, source = share_mover_mode(cfg, share)
+    if mode not in SHARE_ROOT_OK_MODES or primary != pool:
+        why = (f"keine Share-Konfiguration gefunden" if mode is None
+               else f"shareUseCache={mode}, shareCachePool={primary} (aus {source})")
+        log.error(f"Share «{share}» darf laut Share-Einstellung nicht auf den Pool «{pool}» ({why}) – "
+                  f"kein Dataset angelegt, Dateien dieses Shares übersprungen. Share in Unraid auf Primary storage "
+                  f"«{pool}» stellen oder Share aus den path_mappings nehmen.")
+        state[share] = False
+        return False
+
+    dataset = f"{pool_mount[0]}/{share}"
+    if zfs_dataset_exists(dataset):
+        log.error(f"Dataset {dataset} existiert, ist aber nicht unter {root} eingehängt (Mountpoint/canmount prüfen) – "
+                  f"MediaCache ändert daran nichts, Dateien des Shares «{share}» übersprungen")
+        state[share] = False
+        return False
+    if not run_mode:
+        log.info(f"PLAN: würde Dataset {dataset} anlegen (Mountpoint {root}, Owner/Rechte wie {array / share})")
+        state[share] = True
+        return True
+    ok, msg = zfs_create(dataset)
+    if not ok:
+        log.error(f"zfs create {dataset} fehlgeschlagen: {msg} – Dateien des Shares «{share}» übersprungen")
+        state[share] = False
+        return False
+    if not root.is_dir():
+        log.error(f"Dataset {dataset} angelegt, aber nicht unter {root} eingehängt (Mountpoint des Pools prüfen) – "
+                  f"Dateien des Shares «{share}» übersprungen")
+        state[share] = False
+        return False
+    copy_owner_mode(root, array / share, log)
+    log.info(f"Dataset {dataset} angelegt ({root}), Owner/Rechte wie {array / share}")
+    state[share] = True
+    return True
 
 
 def summarize_mover_output(stdout, paths):
